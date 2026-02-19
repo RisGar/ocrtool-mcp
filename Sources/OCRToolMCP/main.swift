@@ -1,444 +1,617 @@
-// OCRToolMCP.swift
-// A Swift-based MCP-compliant module for Vision OCR on macOS
+// OCRToolMCP - MCP Server for macOS Vision OCR
+// Implements the Model Context Protocol (2025-11-25) over stdio transport
+// Spec: https://modelcontextprotocol.io/specification/2025-11-25
 
 import Foundation
 import Vision
 import AppKit
 
-struct OCRRequest: Codable {
-    let image_path: String
-    let lang: String?
-    let enhanced: Bool?
-    let format: String? // Renamed property
-    let comment: Bool? // New property
-    let language: String? // New property
-    let url: String? // New property
-    let base64: String? // New property
-}
+// MARK: - JSON-RPC 2.0 Types
 
-struct BoundingBox: Codable {
-    let x: CGFloat
-    let y: CGFloat
-    let width: CGFloat
-    let height: CGFloat
-}
-
-struct OCRLine: Codable {
-    let text: String
-    let bbox: BoundingBox
-}
-
-struct OCRResponse: Codable {
-    let lines: [OCRLine]
-    
-    // New property for output formatting customization
-    var formattedOutput: String {
-        return lines.map { $0.text }.joined(separator: "\n")
-    }
-
-    var markdownTable: String {
-        guard !lines.isEmpty else { return "No text found." }
-        let header = "| Text | X | Y | Width | Height |"
-        let separator = "|------|---|---|--------|--------|"
-        let rows = lines.map { line in
-            let b = line.bbox
-            return "| \(line.text.replacingOccurrences(of: "|", with: "\\|")) | \(Int(b.x)) | \(Int(b.y)) | \(Int(b.width)) | \(Int(b.height)) |"
-        }
-        return ([header, separator] + rows).joined(separator: "\n")
-    }
-
-    func asCommented(language: String) -> String {
-        let prefix: String
-        switch language.lowercased() {
-        case "python", "shell", "bash":
-            prefix = "# "
-        case "cpp", "c++", "java", "swift", "go":
-            prefix = "// "
-        case "html", "xml":
-            return "<!--\n" + formattedOutput + "\n-->"
-        default:
-            prefix = "// "
-        }
-        return formattedOutput.split(separator: "\n").map { prefix + $0 }.joined(separator: "\n")
-    }
-}
-
-func handleOCR(_ request: OCRRequest) -> OCRResponse {
-    if let urlString = request.url, let url = URL(string: urlString) {
-        do {
-            let data = try Data(contentsOf: url)
-            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".jpg")
-            try data.write(to: tempURL)
-            fputs("🔽 Downloaded image from URL to: \(tempURL.path)\n", stderr)
-            return handleOCR(OCRRequest(
-                image_path: tempURL.path,
-                lang: request.lang,
-                enhanced: request.enhanced,
-                format: request.format,
-                comment: request.comment,
-                language: request.language,
-                url: nil,
-                base64: nil
-            ))
-        } catch {
-            fputs("❌ Failed to download or save image from URL: \(error.localizedDescription)\n", stderr)
-            return OCRResponse(lines: [])
-        }
-    }
-
-    if let base64String = request.base64, !base64String.isEmpty {
-        if let data = Data(base64Encoded: base64String) {
-            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".jpg")
-            do {
-                try data.write(to: tempURL)
-                fputs("🧬 Decoded base64 image to: \(tempURL.path)\n", stderr)
-                return handleOCR(OCRRequest(
-                    image_path: tempURL.path,
-                    lang: request.lang,
-                    enhanced: request.enhanced,
-                    format: request.format,
-                    comment: request.comment,
-                    language: request.language,
-                    url: nil,
-                    base64: nil
-                ))
-            } catch {
-                fputs("❌ Failed to write decoded base64 image: \(error.localizedDescription)\n", stderr)
-                return OCRResponse(lines: [])
-            }
-        } else {
-            fputs("❌ Invalid base64 image data.\n", stderr)
-            return OCRResponse(lines: [])
-        }
-    }
-
-    fputs("🖼️ Loading image at: \(request.image_path)\n", stderr)
-    
-    guard FileManager.default.fileExists(atPath: request.image_path) else {
-        fputs("Error: Image file not found at path: \(request.image_path)\n", stderr)
-        return OCRResponse(lines: [])
-    }
-
-    guard let nsImage = NSImage(contentsOfFile: request.image_path),
-          let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-        fputs("Error: Unsupported or unreadable image format at path: \(request.image_path)\n", stderr)
-        return OCRResponse(lines: [])
-    }
-
-    let size = CGSize(width: cgImage.width, height: cgImage.height)
-    let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-    var results: [OCRLine] = []
-
-    let req = VNRecognizeTextRequest { req, err in
-        guard err == nil else { return }
-        guard let observations = req.results as? [VNRecognizedTextObservation] else { return }
-
-        let blocks = observations.compactMap { obs -> OCRLine? in
-            guard let candidate = obs.topCandidates(1).first else { return nil }
-            let rect = VNImageRectForNormalizedRect(obs.boundingBox, Int(size.width), Int(size.height))
-            return OCRLine(text: candidate.string, bbox: BoundingBox(x: rect.origin.x, y: rect.origin.y, width: rect.width, height: rect.height))
-        }
-
-        results = blocks
-    }
-
-    req.recognitionLevel = .accurate
-    req.usesLanguageCorrection = true
-    req.recognitionLanguages = request.lang?.components(separatedBy: "+") ?? ["zh-Hans", "en-US"]
-
-    do {
-        try handler.perform([req])
-    } catch {
-        fputs("Vision error: \(error.localizedDescription)\n", stderr)
-    }
-    
-    return OCRResponse(lines: results)
-}
-
-// JSON-RPC structure
-struct JSONRPCRequestFlexible: Codable {
-    let jsonrpc: String
-    let id: CodableValue
-    let method: String
-    let params: [String: CodableValue]
-}
-
-enum CodableValue: Codable {
+/// A JSON value that can be any valid JSON type.
+/// Used for flexible encoding/decoding of JSON-RPC messages.
+enum JSONValue: Codable, Equatable {
     case string(String)
+    case number(Double)
+    case integer(Int)
     case bool(Bool)
-    case int(Int)
-    case object([String: CodableValue]) // New case
-
-    var string: String? {
-        if case .string(let str) = self { return str }
-        return nil
-    }
-
-    var bool: Bool? {
-        if case .bool(let b) = self { return b }
-        return nil
-    }
-
-    var int: Int? {
-        if case .int(let i) = self { return i }
-        return nil
-    }
-
-    var jsonStringEscaped: String {
-        switch self {
-        case .string(let str): return "\"\(str)\""
-        case .int(let i): return String(i)
-        case .bool(let b): return b ? "true" : "false"
-        case .object(_): return "\"[object]\"" // Updated to handle .object
-        }
-    }
+    case null
+    case array([JSONValue])
+    case object([String: JSONValue])
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
-        if let str = try? container.decode(String.self) {
-            self = .string(str)
-        } else if let bool = try? container.decode(Bool.self) {
-            self = .bool(bool)
-        } else if let int = try? container.decode(Int.self) {
-            self = .int(int)
-        } else if let obj = try? container.decode([String: CodableValue].self) { // Support for nested objects
+        // Order matters: Bool before Int/Double because Bool decodes as Int in Swift
+        if container.decodeNil() {
+            self = .null
+        } else if let b = try? container.decode(Bool.self) {
+            self = .bool(b)
+        } else if let i = try? container.decode(Int.self) {
+            self = .integer(i)
+        } else if let d = try? container.decode(Double.self) {
+            self = .number(d)
+        } else if let s = try? container.decode(String.self) {
+            self = .string(s)
+        } else if let arr = try? container.decode([JSONValue].self) {
+            self = .array(arr)
+        } else if let obj = try? container.decode([String: JSONValue].self) {
             self = .object(obj)
         } else {
-            throw DecodingError.typeMismatch(CodableValue.self, DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Invalid type"))
+            throw DecodingError.typeMismatch(
+                JSONValue.self,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Cannot decode JSONValue")
+            )
         }
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         switch self {
-        case .string(let str): try container.encode(str)
+        case .string(let s): try container.encode(s)
+        case .number(let d): try container.encode(d)
+        case .integer(let i): try container.encode(i)
         case .bool(let b): try container.encode(b)
-        case .int(let i): try container.encode(i)
-        case .object(let dict): try container.encode(dict) // Support for encoding .object
+        case .null: try container.encodeNil()
+        case .array(let arr): try container.encode(arr)
+        case .object(let obj): try container.encode(obj)
+        }
+    }
+
+    /// Extract a string value, or nil
+    var stringValue: String? {
+        if case .string(let s) = self { return s }
+        return nil
+    }
+
+    /// Extract a bool value, or nil
+    var boolValue: Bool? {
+        if case .bool(let b) = self { return b }
+        return nil
+    }
+
+    /// Extract an object value, or nil
+    var objectValue: [String: JSONValue]? {
+        if case .object(let obj) = self { return obj }
+        return nil
+    }
+}
+
+/// JSON-RPC 2.0 Request ID — can be string or integer, never null per MCP spec.
+enum JSONRPCID: Codable, Equatable {
+    case string(String)
+    case integer(Int)
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let i = try? container.decode(Int.self) {
+            self = .integer(i)
+        } else if let s = try? container.decode(String.self) {
+            self = .string(s)
+        } else {
+            throw DecodingError.typeMismatch(
+                JSONRPCID.self,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "ID must be string or integer")
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let s): try container.encode(s)
+        case .integer(let i): try container.encode(i)
         }
     }
 }
 
-struct JSONRPCResponse: Codable {
+/// Incoming JSON-RPC message — could be a request (has id) or notification (no id).
+struct IncomingMessage: Decodable {
     let jsonrpc: String
-    let id: CodableValue
-    let result: OCRResponse
+    let id: JSONRPCID?
+    let method: String?
+    let params: JSONValue?
+
+    /// Whether this is a valid JSON-RPC 2.0 message
+    var isValid: Bool { jsonrpc == "2.0" }
+
+    /// Whether this is a notification (no id)
+    var isNotification: Bool { id == nil && method != nil }
+
+    /// Whether this is a request (has id and method)
+    var isRequest: Bool { id != nil && method != nil }
 }
 
-func readLineData() -> Data? {
-    guard let line = readLine(strippingNewline: true) else { return nil }
-    return line.data(using: .utf8)
+// MARK: - JSON-RPC Error Codes
+
+/// Standard JSON-RPC 2.0 error codes
+enum JSONRPCErrorCode {
+    static let parseError = -32700
+    static let invalidRequest = -32600
+    static let methodNotFound = -32601
+    static let invalidParams = -32602
+    static let internalError = -32603
 }
 
-func showHelpAndExit() {
-    let helpText = """
-    OCRToolMCP Help - Parameters Overview:
-    
-    image / image_path : Path to the local image file (string)
-    url                : URL to download image (string)
-    base64             : Base64 encoded image (string)
-    lang               : OCR language(s), e.g., "en+zh" (string)
-    enhanced           : Use enhanced recognition (true/false)
-    format             : Output format (text, simple, table, markdown, auto, full, structured)
-    output.insertAsComment : If true, insert output as code comments
-    output.language    : Language style for comment output, e.g., python, swift, html
-    
-    JSON-RPC Method: "ocr_text"
-    
-    Example usage:
-    {
-      "jsonrpc": "2.0",
-      "id": 1,
-      "method": "ocr_text",
-      "params": {
-        "image": "sample.jpg",
-        "lang": "en+zh",
-        "format": "markdown"
-      }
-    }
-    """
-    print(helpText)
-    exit(0)
-}
+// MARK: - Response Writing
 
-if CommandLine.arguments.contains("--help") {
-    showHelpAndExit()
-}
-
-while let inputData = readLineData() {
-    guard let inputStr = String(data: inputData, encoding: .utf8),
-          inputStr.trimmingCharacters(in: .whitespacesAndNewlines).first == "{" else { continue }
-    let decoder = JSONDecoder()
+/// Writes a single JSON-RPC response line to stdout.
+/// Per MCP stdio transport spec: messages are newline-delimited, must not contain embedded newlines.
+func writeResponse(_ value: JSONValue) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys] // Compact, no pretty-printing — no embedded newlines
     do {
-        let flexible = try decoder.decode(JSONRPCRequestFlexible.self, from: inputData)
-        switch flexible.method {
-        case "ocr_text":
-            let imagePath = flexible.params["image"]?.string ?? flexible.params["image_path"]?.string ?? ""
-            let hasImagePath = !imagePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            let hasUrl = flexible.params["url"]?.string?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            let hasBase64 = flexible.params["base64"]?.string?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            
-            if [hasImagePath, hasUrl, hasBase64].filter({ $0 }).count != 1 {
-                fputs("""
-                {
-                  "jsonrpc": "2.0",
-                  "id": \(flexible.id.jsonStringEscaped),
-                  "error": {
-                    "code": -32602,
-                    "message": "Exactly one of 'image'/'image_path', 'url', or 'base64' must be provided."
-                  }
-                }
-                \n
-                """, stdout)
-                fflush(stdout)
-                continue
-            }
-
-            if hasImagePath && hasUrl {
-                fputs("""
-                {
-                  "jsonrpc": "2.0",
-                  "id": \(flexible.id.jsonStringEscaped),
-                  "error": {
-                    "code": -32602,
-                    "message": "Conflicting parameters: use only one of 'image'/'image_path' or 'url'."
-                  }
-                }
-                \n
-                """, stdout)
-                fflush(stdout)
-                continue
-            }
-            
-            
-            if let formatValue = flexible.params["format"]?.string,
-               !["text", "simple", "table", "markdown", "auto", "full", "structured"].contains(formatValue.lowercased()) {
-                fputs("""
-                {
-                  "jsonrpc": "2.0",
-                  "id": \(flexible.id.jsonStringEscaped),
-                  "error": {
-                    "code": -32602,
-                    "message": "Invalid value for 'format': '\(formatValue)'",
-                    "hint": "Allowed values are: text, simple, table, markdown, auto, full, structured"
-                  }
-                }
-                \n
-                """, stdout)
-                fflush(stdout)
-                continue
-            }
-
-            var fullPath = imagePath.replacingOccurrences(of: "~", with: FileManager.default.homeDirectoryForCurrentUser.path)
-            if !fullPath.hasPrefix("/") {
-                fullPath = FileManager.default.currentDirectoryPath + "/" + fullPath
-            }
-
-            let req = OCRRequest(
-                image_path: fullPath,
-                lang: flexible.params["lang"]?.string ?? "zh+en",
-                enhanced: flexible.params["enhanced"]?.bool ?? true,
-                format: flexible.params["format"]?.string,
-                comment: flexible.params["output.insertAsComment"]?.bool,
-                language: flexible.params["output.language"]?.string,
-                url: flexible.params["url"]?.string,
-                base64: flexible.params["base64"]?.string
-            )
-            let result = handleOCR(req)
-            
-            // Updated conditional output check
-            if req.comment == true {
-                let lang = req.language ?? "python"
-                print(result.asCommented(language: lang))
-            } else {
-                switch req.format?.lowercased() {
-                case "text", "simple":
-                    print(result.formattedOutput)
-                case "table", "markdown":
-                    print(result.markdownTable)
-                case "auto":
-                    if result.lines.count == 1 {
-                        print(result.formattedOutput)
-                    } else {
-                        print(result.markdownTable)
-                    }
-                case "full", "structured", .none:
-                    let response = JSONRPCResponse(jsonrpc: "2.0", id: flexible.id, result: result)
-                    let encoded = try JSONEncoder().encode(response)
-                    let prettyPrintedData = try JSONSerialization.jsonObject(with: encoded)
-                    let formattedJSON = try JSONSerialization.data(withJSONObject: prettyPrintedData, options: [.prettyPrinted])
-                    if let formattedStr = String(data: formattedJSON, encoding: .utf8) {
-                        fputs(formattedStr + "\n", stdout)
-                        fflush(stdout)
-                    }
-                default:
-                    fputs("Unknown format option: \(req.format ?? "nil")\n", stderr)
-                    print(result.formattedOutput)
-                }
-            }
-        case "initialize":
-            let response = """
-            {
-              "jsonrpc": "2.0",
-              "id": \(flexible.id.jsonStringEscaped),
-              "result": {
-                "protocolVersion": "2024-11-05",
-                "metadata": {
-                  "name": "ocrtool-mcp",
-                  "description": "Local macOS OCR tool using Vision Framework",
-                  "version": "0.1.0"
-                }
-              }
-            }
-            \n
-            """
-            fputs(response, stdout)
-            fflush(stdout)
-
-        case "shutdown":
-            let response = """
-            {
-              "jsonrpc": "2.0",
-              "id": \(flexible.id.jsonStringEscaped),
-              "result": null
-            }
-            \n
-            """
-            fputs(response, stdout)
-            fflush(stdout)
-            exit(0)
-
-        case "notifications/cancelled":
-            fputs("⚠️ Request cancelled (reason: timeout or interruption)\n", stderr)
-
-        default:
-            fputs("""
-            {
-              "jsonrpc": "2.0",
-              "id": \(flexible.id.jsonStringEscaped),
-              "error": {
-                "code": -32601,
-                "message": "Method not found"
-              }
-            }
-            \n
-            """, stdout)
+        let data = try encoder.encode(value)
+        if let line = String(data: data, encoding: .utf8) {
+            fputs(line + "\n", stdout)
             fflush(stdout)
         }
     } catch {
-        fputs("Decode error: \(error.localizedDescription)\n", stderr)
-        fputs("""
-        {
-          "jsonrpc": "2.0",
-          "id": null,
-          "error": {
-            "code": -32602,
-            "message": "Invalid request: Ensure JSON is complete and contains fields like 'method' and 'params'.",
-            "details": "\(error.localizedDescription)"
-          }
-        }
-        \n
-        """, stdout)
-        fflush(stdout)
+        log("Failed to encode response: \(error.localizedDescription)")
     }
 }
+
+/// Build and write a JSON-RPC result response
+func writeResult(id: JSONRPCID, result: JSONValue) {
+    writeResponse(.object([
+        "jsonrpc": .string("2.0"),
+        "id": idToJSON(id),
+        "result": result
+    ]))
+}
+
+/// Build and write a JSON-RPC error response
+func writeError(id: JSONRPCID?, code: Int, message: String, data: JSONValue? = nil) {
+    var error: [String: JSONValue] = [
+        "code": .integer(code),
+        "message": .string(message)
+    ]
+    if let d = data {
+        error["data"] = d
+    }
+
+    var response: [String: JSONValue] = [
+        "jsonrpc": .string("2.0"),
+        "error": .object(error)
+    ]
+    if let id = id {
+        response["id"] = idToJSON(id)
+    } else {
+        response["id"] = .null
+    }
+    writeResponse(.object(response))
+}
+
+/// Convert JSONRPCID to JSONValue
+func idToJSON(_ id: JSONRPCID) -> JSONValue {
+    switch id {
+    case .string(let s): return .string(s)
+    case .integer(let i): return .integer(i)
+    }
+}
+
+/// Log to stderr (allowed by MCP spec for stdio transport)
+func log(_ message: String) {
+    fputs("[ocrtool-mcp] \(message)\n", stderr)
+}
+
+// MARK: - OCR Engine
+
+struct OCRResult {
+    struct Line {
+        let text: String
+        let x: Int
+        let y: Int
+        let width: Int
+        let height: Int
+    }
+    let lines: [Line]
+    let error: String?
+}
+
+/// Perform OCR on an image and return structured results.
+func performOCR(imagePath: String?, imageURL: String?, imageBase64: String?, languages: String?) -> OCRResult {
+    // Resolve image to a local file path
+    let resolvedPath: String
+    do {
+        resolvedPath = try resolveImageSource(path: imagePath, url: imageURL, base64: imageBase64)
+    } catch {
+        return OCRResult(lines: [], error: error.localizedDescription)
+    }
+
+    log("Loading image at: \(resolvedPath)")
+
+    guard FileManager.default.fileExists(atPath: resolvedPath) else {
+        return OCRResult(lines: [], error: "Image file not found at path: \(resolvedPath)")
+    }
+
+    guard let nsImage = NSImage(contentsOfFile: resolvedPath),
+          let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        return OCRResult(lines: [], error: "Unsupported or unreadable image format at path: \(resolvedPath)")
+    }
+
+    let size = CGSize(width: cgImage.width, height: cgImage.height)
+    let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+    var ocrLines: [OCRResult.Line] = []
+
+    let request = VNRecognizeTextRequest { request, error in
+        guard error == nil else { return }
+        guard let observations = request.results as? [VNRecognizedTextObservation] else { return }
+
+        ocrLines = observations.compactMap { obs -> OCRResult.Line? in
+            guard let candidate = obs.topCandidates(1).first else { return nil }
+            let rect = VNImageRectForNormalizedRect(obs.boundingBox, Int(size.width), Int(size.height))
+            return OCRResult.Line(
+                text: candidate.string,
+                x: Int(rect.origin.x),
+                y: Int(rect.origin.y),
+                width: Int(rect.width),
+                height: Int(rect.height)
+            )
+        }
+    }
+
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = true
+    request.recognitionLanguages = languages?.components(separatedBy: "+") ?? ["en-US"]
+
+    do {
+        try handler.perform([request])
+    } catch {
+        return OCRResult(lines: [], error: "Vision OCR failed: \(error.localizedDescription)")
+    }
+
+    return OCRResult(lines: ocrLines, error: nil)
+}
+
+/// Resolve an image source (path, URL, or base64) to a local file path.
+func resolveImageSource(path: String?, url: String?, base64: String?) throws -> String {
+    if let urlString = url, !urlString.isEmpty {
+        guard let downloadURL = URL(string: urlString) else {
+            throw NSError(domain: "OCR", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL: \(urlString)"])
+        }
+        let data = try Data(contentsOf: downloadURL)
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".jpg")
+        try data.write(to: tempURL)
+        log("Downloaded image from URL to: \(tempURL.path)")
+        return tempURL.path
+    }
+
+    if let base64String = base64, !base64String.isEmpty {
+        guard let data = Data(base64Encoded: base64String) else {
+            throw NSError(domain: "OCR", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid base64 image data"])
+        }
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".jpg")
+        try data.write(to: tempURL)
+        log("Decoded base64 image to: \(tempURL.path)")
+        return tempURL.path
+    }
+
+    if let imagePath = path, !imagePath.isEmpty {
+        var fullPath = imagePath.replacingOccurrences(of: "~", with: FileManager.default.homeDirectoryForCurrentUser.path)
+        if !fullPath.hasPrefix("/") {
+            fullPath = FileManager.default.currentDirectoryPath + "/" + fullPath
+        }
+        return fullPath
+    }
+
+    throw NSError(domain: "OCR", code: 3, userInfo: [NSLocalizedDescriptionKey: "No image source provided. Supply 'image_path', 'url', or 'base64'."])
+}
+
+// MARK: - Tool Definitions
+
+/// The OCR tool definition per MCP spec
+let ocrToolDefinition: JSONValue = .object([
+    "name": .string("ocr_text"),
+    "title": .string("OCR Text Extraction"),
+    "description": .string("Extract text from an image using macOS Vision OCR. Provide exactly one image source: a local file path, a URL, or base64-encoded data."),
+    "inputSchema": .object([
+        "type": .string("object"),
+        "properties": .object([
+            "image_path": .object([
+                "type": .string("string"),
+                "description": .string("Absolute or relative path to a local image file")
+            ]),
+            "url": .object([
+                "type": .string("string"),
+                "description": .string("URL to download the image from")
+            ]),
+            "base64": .object([
+                "type": .string("string"),
+                "description": .string("Base64-encoded image data")
+            ]),
+            "lang": .object([
+                "type": .string("string"),
+                "description": .string("OCR languages separated by '+', e.g. 'en-US+zh-Hans'. Default: 'en-US'")
+            ])
+        ])
+    ])
+])
+
+// MARK: - MCP Server State
+
+/// Server lifecycle state per MCP spec
+enum ServerState {
+    case awaitingInit
+    case running
+}
+
+var serverState: ServerState = .awaitingInit
+
+// MARK: - Request Handlers
+
+/// Handle the `initialize` request per MCP lifecycle spec
+func handleInitialize(id: JSONRPCID, params: JSONValue?) {
+    guard serverState == .awaitingInit else {
+        writeError(id: id, code: JSONRPCErrorCode.invalidRequest, message: "Server already initialized")
+        return
+    }
+
+    // Extract client's requested protocol version
+    let clientVersion = params?.objectValue?["protocolVersion"]?.stringValue
+
+    // We support 2025-11-25 and 2024-11-05
+    let supportedVersions = ["2025-11-25", "2024-11-05"]
+    let negotiatedVersion: String
+    if let cv = clientVersion, supportedVersions.contains(cv) {
+        negotiatedVersion = cv
+    } else {
+        // Respond with our latest supported version
+        negotiatedVersion = supportedVersions[0]
+    }
+
+    writeResult(id: id, result: .object([
+        "protocolVersion": .string(negotiatedVersion),
+        "capabilities": .object([
+            "tools": .object([:])
+        ]),
+        "serverInfo": .object([
+            "name": .string("ocrtool-mcp"),
+            "version": .string("1.0.0")
+        ])
+    ]))
+}
+
+/// Handle the `notifications/initialized` notification
+func handleInitialized() {
+    guard serverState == .awaitingInit else {
+        log("Received initialized notification in unexpected state")
+        return
+    }
+    serverState = .running
+    log("Session initialized, entering operation phase")
+}
+
+/// Handle `ping` request
+func handlePing(id: JSONRPCID) {
+    writeResult(id: id, result: .object([:]))
+}
+
+/// Handle `tools/list` request
+func handleToolsList(id: JSONRPCID) {
+    writeResult(id: id, result: .object([
+        "tools": .array([ocrToolDefinition])
+    ]))
+}
+
+/// Handle `tools/call` request
+func handleToolsCall(id: JSONRPCID, params: JSONValue?) {
+    guard let paramsObj = params?.objectValue else {
+        writeError(id: id, code: JSONRPCErrorCode.invalidParams, message: "Missing params")
+        return
+    }
+
+    guard let toolName = paramsObj["name"]?.stringValue else {
+        writeError(id: id, code: JSONRPCErrorCode.invalidParams, message: "Missing 'name' in params")
+        return
+    }
+
+    guard toolName == "ocr_text" else {
+        writeError(id: id, code: JSONRPCErrorCode.invalidParams, message: "Unknown tool: \(toolName)")
+        return
+    }
+
+    let arguments = paramsObj["arguments"]?.objectValue ?? [:]
+
+    // Extract tool arguments
+    let imagePath = arguments["image_path"]?.stringValue ?? arguments["image"]?.stringValue
+    let imageURL = arguments["url"]?.stringValue
+    let imageBase64 = arguments["base64"]?.stringValue
+    let lang = arguments["lang"]?.stringValue
+
+    // Validate: exactly one image source must be provided
+    let sourceCount = [imagePath, imageURL, imageBase64].compactMap({ $0 }).filter({ !$0.isEmpty }).count
+    if sourceCount == 0 {
+        writeResult(id: id, result: .object([
+            "content": .array([
+                .object([
+                    "type": .string("text"),
+                    "text": .string("Error: No image source provided. Supply exactly one of 'image_path', 'url', or 'base64'.")
+                ])
+            ]),
+            "isError": .bool(true)
+        ]))
+        return
+    }
+    if sourceCount > 1 {
+        writeResult(id: id, result: .object([
+            "content": .array([
+                .object([
+                    "type": .string("text"),
+                    "text": .string("Error: Multiple image sources provided. Supply exactly one of 'image_path', 'url', or 'base64'.")
+                ])
+            ]),
+            "isError": .bool(true)
+        ]))
+        return
+    }
+
+    // Perform OCR
+    let result = performOCR(imagePath: imagePath, imageURL: imageURL, imageBase64: imageBase64, languages: lang)
+
+    if let error = result.error {
+        writeResult(id: id, result: .object([
+            "content": .array([
+                .object([
+                    "type": .string("text"),
+                    "text": .string("Error: \(error)")
+                ])
+            ]),
+            "isError": .bool(true)
+        ]))
+        return
+    }
+
+    if result.lines.isEmpty {
+        writeResult(id: id, result: .object([
+            "content": .array([
+                .object([
+                    "type": .string("text"),
+                    "text": .string("No text found in image.")
+                ])
+            ]),
+            "isError": .bool(false)
+        ]))
+        return
+    }
+
+    // Format output as plain text (one line per recognized text block)
+    let textOutput = result.lines.map { $0.text }.joined(separator: "\n")
+
+    writeResult(id: id, result: .object([
+        "content": .array([
+            .object([
+                "type": .string("text"),
+                "text": .string(textOutput)
+            ])
+        ]),
+        "isError": .bool(false)
+    ]))
+}
+
+// MARK: - Message Dispatch
+
+/// Route an incoming JSON-RPC message to the appropriate handler
+func dispatch(_ message: IncomingMessage) {
+    guard message.isValid else {
+        writeError(id: message.id, code: JSONRPCErrorCode.invalidRequest, message: "Invalid JSON-RPC version (must be \"2.0\")")
+        return
+    }
+
+    guard let method = message.method else {
+        writeError(id: message.id, code: JSONRPCErrorCode.invalidRequest, message: "Missing method")
+        return
+    }
+
+    // Handle notifications (no id — must not send a response)
+    if message.isNotification {
+        switch method {
+        case "notifications/initialized":
+            handleInitialized()
+        case "notifications/cancelled":
+            log("Request cancelled by client")
+        case "notifications/progress":
+            break // Silently accept
+        case "notifications/roots/list_changed":
+            break // Silently accept
+        default:
+            log("Ignoring unknown notification: \(method)")
+        }
+        return
+    }
+
+    // From here on, it's a request (has id)
+    guard let id = message.id else {
+        writeError(id: nil, code: JSONRPCErrorCode.invalidRequest, message: "Request missing id")
+        return
+    }
+
+    // initialize and ping are allowed before initialized notification
+    switch method {
+    case "initialize":
+        handleInitialize(id: id, params: message.params)
+        return
+    case "ping":
+        handlePing(id: id)
+        return
+    default:
+        break
+    }
+
+    // All other requests require the server to be in running state
+    guard serverState == .running else {
+        writeError(id: id, code: JSONRPCErrorCode.invalidRequest,
+                   message: "Server not yet initialized. Send 'initialize' request first.")
+        return
+    }
+
+    switch method {
+    case "tools/list":
+        handleToolsList(id: id)
+    case "tools/call":
+        handleToolsCall(id: id, params: message.params)
+    default:
+        writeError(id: id, code: JSONRPCErrorCode.methodNotFound, message: "Method not found: \(method)")
+    }
+}
+
+// MARK: - Main Loop (stdio transport)
+
+// Per MCP stdio transport spec:
+// - Messages are newline-delimited JSON-RPC
+// - Messages MUST NOT contain embedded newlines
+// - Server reads from stdin, writes to stdout
+// - Server MAY write to stderr for logging
+
+if CommandLine.arguments.contains("--help") || CommandLine.arguments.contains("-h") {
+    let help = """
+    ocrtool-mcp - MCP Server for macOS Vision OCR
+
+    This server implements the Model Context Protocol (2025-11-25) over stdio.
+    It exposes an 'ocr_text' tool for extracting text from images using
+    Apple's Vision framework.
+
+    Usage:
+      ocrtool-mcp          Start the MCP server (reads JSON-RPC from stdin)
+      ocrtool-mcp --help   Show this help message
+
+    The server communicates via JSON-RPC 2.0 over stdin/stdout.
+    Configure it in your MCP client (e.g., Claude Desktop) as a stdio server.
+
+    Tool: ocr_text
+      Arguments:
+        image_path  - Local file path to an image
+        url         - URL to download an image from
+        base64      - Base64-encoded image data
+        lang        - OCR languages (e.g. "en-US+zh-Hans")
+    """
+    fputs(help + "\n", stderr)
+    exit(0)
+}
+
+log("Server starting, awaiting initialization...")
+
+let decoder = JSONDecoder()
+
+while let line = readLine(strippingNewline: true) {
+    // Skip empty lines
+    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { continue }
+
+    // Parse the JSON-RPC message
+    guard let data = trimmed.data(using: .utf8) else {
+        log("Failed to convert input to UTF-8 data")
+        continue
+    }
+
+    do {
+        let message = try decoder.decode(IncomingMessage.self, from: data)
+        dispatch(message)
+    } catch {
+        log("JSON parse error: \(error.localizedDescription)")
+        writeError(id: nil, code: JSONRPCErrorCode.parseError,
+                   message: "Parse error: \(error.localizedDescription)")
+    }
+}
+
+// stdin closed — per MCP spec, this is the shutdown signal for stdio transport
+log("stdin closed, shutting down")
