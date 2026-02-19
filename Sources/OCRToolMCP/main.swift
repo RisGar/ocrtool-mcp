@@ -265,8 +265,6 @@ if CommandLine.arguments.contains("--help") {
     showHelpAndExit()
 }
 
-print("[ocrtool-mcp] Ready to accept JSON-RPC over stdin")
-
 while let inputData = readLineData() {
     guard let inputStr = String(data: inputData, encoding: .utf8),
           inputStr.trimmingCharacters(in: .whitespacesAndNewlines).first == "{" else { continue }
